@@ -1,0 +1,634 @@
+import javax.swing.*;
+import java.awt.*;
+import java.awt.event.*;
+import java.util.*;
+import java.util.List;
+
+public class ErgeltBoardGame extends JFrame {
+    private static final int[][] LAYOUT = {
+        {1,1,1},
+        {1,1,1,1},
+        {1,1,1,1,1},
+        {0,1,1,1,1,0},
+        {0,0,1,1,1,0,0}
+    };
+    private static final int CELL_SIZE = 50;
+    private static final Color BOARD_COLOR = new Color(0xA0522D);
+    private static final Color DISABLED_COLOR = new Color(0x8B4513);
+    private static final Color BLACK = Color.BLACK;
+    private static final Color WHITE = Color.WHITE;
+
+    private String currentPlayer = "black";
+    private String[][] state;
+    private boolean gameOver = false;
+    private java.util.List<String[][]> history = new ArrayList<>();
+    private java.util.List<String[][]> future = new ArrayList<>();
+
+    private BoardPanel boardPanel;
+    private JLabel infoLabel, endLabel, countLabel;
+    private JButton restartBtn, undoBtn, redoBtn;
+    private String botColor = "white";
+    private JButton botColorBtn, hintBtn;
+    private Point hintMove = null;
+
+    private Random random = new Random();
+    private Timer botTimer = new Timer(600, e -> botMove());
+    private Map<String, Integer> memo = new HashMap<>();
+    private static final int WIN_SCORE = 10000;
+    private static final int LOSE_SCORE = -10000;
+    private static final int DRAW_SCORE = 0;
+    private static final int MAX_DEPTH = 6; // You can increase for more strength, but it will be slower
+
+    private static class TablebaseEntry {
+        int score;
+        Point bestMove;
+        TablebaseEntry(int score, Point bestMove) {
+            this.score = score;
+            this.bestMove = bestMove;
+        }
+    }
+    private Map<String, TablebaseEntry> tablebase = new HashMap<>();
+    private boolean tablebaseReady = false;
+
+    public ErgeltBoardGame() {
+        setTitle("Ergelt Board Game");
+        setDefaultCloseOperation(EXIT_ON_CLOSE);
+        setLayout(new BorderLayout());
+
+        // Show dialog while computing tablebase
+        JDialog dialog = new JDialog(this, "Building Tablebase...", true);
+        JLabel label = new JLabel("Please wait, computing all best moves...");
+        label.setBorder(BorderFactory.createEmptyBorder(20, 20, 20, 20));
+        dialog.add(label);
+        dialog.pack();
+        dialog.setLocationRelativeTo(null);
+        new Thread(() -> {
+            computeTablebase();
+            dialog.dispose();
+        }).start();
+        dialog.setVisible(true);
+
+        boardPanel = new BoardPanel();
+        add(boardPanel, BorderLayout.CENTER);
+
+        JPanel bottomPanel = new JPanel(new GridLayout(2, 1));
+        JPanel infoPanel = new JPanel();
+        infoLabel = new JLabel("Current turn: Black");
+        countLabel = new JLabel("Black: 0 | White: 0");
+        endLabel = new JLabel("");
+        endLabel.setForeground(Color.RED);
+        infoPanel.add(infoLabel);
+        infoPanel.add(countLabel);
+        infoPanel.add(endLabel);
+
+        JPanel buttonPanel = new JPanel();
+        restartBtn = new JButton("Restart");
+        undoBtn = new JButton("Undo");
+        redoBtn = new JButton("Redo");
+        botColorBtn = new JButton("Bot: White");
+        hintBtn = new JButton("Hint");
+        buttonPanel.add(restartBtn);
+        buttonPanel.add(undoBtn);
+        buttonPanel.add(redoBtn);
+        buttonPanel.add(botColorBtn);
+        buttonPanel.add(hintBtn);
+
+        bottomPanel.add(infoPanel);
+        bottomPanel.add(buttonPanel);
+        add(bottomPanel, BorderLayout.SOUTH);
+
+        restartBtn.addActionListener(e -> resetGame());
+        undoBtn.addActionListener(e -> undo());
+        redoBtn.addActionListener(e -> redo());
+        botColorBtn.addActionListener(e -> toggleBotColor());
+        hintBtn.addActionListener(e -> showHint());
+
+        resetGame();
+        setSize(400, 400);
+        setLocationRelativeTo(null);
+        setVisible(true);
+    }
+
+    private void resetGame() {
+        state = new String[LAYOUT.length][];
+        for (int r = 0; r < LAYOUT.length; r++) {
+            state[r] = new String[LAYOUT[r].length];
+        }
+        currentPlayer = "black";
+        gameOver = false;
+        history.clear();
+        future.clear();
+        pushHistory();
+        updateInfo();
+        boardPanel.repaint();
+    }
+
+    private void pushHistory() {
+        String[][] snapshot = new String[state.length][];
+        for (int r = 0; r < state.length; r++) {
+            snapshot[r] = Arrays.copyOf(state[r], state[r].length);
+        }
+        history.add(snapshot);
+        if (history.size() > 100) history.remove(0);
+        future.clear();
+    }
+
+    private void undo() {
+        if (history.size() < 2) return;
+        future.add(history.remove(history.size() - 1));
+        String[][] prev = history.get(history.size() - 1);
+        for (int r = 0; r < state.length; r++) {
+            state[r] = Arrays.copyOf(prev[r], prev[r].length);
+        }
+        currentPlayer = currentPlayer.equals("black") ? "white" : "black";
+        gameOver = false;
+        endLabel.setText("");
+        updateInfo();
+        boardPanel.repaint();
+    }
+
+    private void redo() {
+        if (future.isEmpty()) return;
+        String[][] redoState = future.remove(future.size() - 1);
+        for (int r = 0; r < state.length; r++) {
+            state[r] = Arrays.copyOf(redoState[r], redoState[r].length);
+        }
+        history.add(redoState);
+        currentPlayer = currentPlayer.equals("black") ? "white" : "black";
+        gameOver = false;
+        endLabel.setText("");
+        updateInfo();
+        boardPanel.repaint();
+    }
+
+    private void updateInfo() {
+        int blackCount = 0, whiteCount = 0;
+        for (int r = 0; r < state.length; r++) {
+            for (int c = 0; c < state[r].length; c++) {
+                if ("black".equals(state[r][c])) blackCount++;
+                if ("white".equals(state[r][c])) whiteCount++;
+            }
+        }
+        countLabel.setText("Black: " + blackCount + " | White: " + whiteCount);
+        infoLabel.setText("Current turn: " + capitalize(currentPlayer));
+    }
+
+    private void endGame() {
+        gameOver = true;
+        int blackCount = 0, whiteCount = 0;
+        for (int r = 0; r < state.length; r++) {
+            for (int c = 0; c < state[r].length; c++) {
+                if ("black".equals(state[r][c])) blackCount++;
+                if ("white".equals(state[r][c])) whiteCount++;
+            }
+        }
+        if (blackCount > whiteCount) {
+            endLabel.setText("Game over. Black has won.");
+        } else if (whiteCount > blackCount) {
+            endLabel.setText("Game over. White has won.");
+        } else {
+            endLabel.setText("Game over. It's a draw.");
+        }
+    }
+
+    private String capitalize(String s) {
+        return s.substring(0,1).toUpperCase() + s.substring(1);
+    }
+
+    private class BoardPanel extends JPanel {
+        public BoardPanel() {
+            setPreferredSize(new Dimension(350, 300));
+            addMouseListener(new MouseAdapter() {
+                public void mouseClicked(MouseEvent e) {
+                    if (gameOver) return;
+                    Point cell = getCellAt(e.getX(), e.getY());
+                    if (cell == null) return;
+                    int r = cell.x, c = cell.y;
+                    if (state[r][c] != null) return;
+                    if (!isLegalMove(r, c)) return;
+                    pushHistory();
+                    state[r][c] = currentPlayer;
+                    removeSmallerStones(currentPlayer, getGroup(r, c, currentPlayer, new HashSet<>()).size());
+                    currentPlayer = currentPlayer.equals("black") ? "white" : "black";
+                    updateInfo();
+                    if (!hasLegalMoves(currentPlayer)) {
+                        endGame();
+                    }
+                    repaint();
+                    clearHint();
+                    maybeTriggerBot();
+                }
+            });
+        }
+
+        private Point getCellAt(int x, int y) {
+            int yOffset = 30;
+            for (int r = 0; r < LAYOUT.length; r++) {
+                int rowLen = LAYOUT[r].length;
+                int xOffset = (getWidth() - rowLen * CELL_SIZE) / 2;
+                for (int c = 0; c < rowLen; c++) {
+                    if (LAYOUT[r][c] == 0) continue;
+                    int cx = xOffset + c * CELL_SIZE;
+                    int cy = yOffset + r * CELL_SIZE;
+                    Rectangle rect = new Rectangle(cx, cy, CELL_SIZE, CELL_SIZE);
+                    if (rect.contains(x, y)) return new Point(r, c);
+                }
+            }
+            return null;
+        }
+
+        protected void paintComponent(Graphics g) {
+            super.paintComponent(g);
+            int yOffset = 30;
+            for (int r = 0; r < LAYOUT.length; r++) {
+                int rowLen = LAYOUT[r].length;
+                int xOffset = (getWidth() - rowLen * CELL_SIZE) / 2;
+                for (int c = 0; c < rowLen; c++) {
+                    if (LAYOUT[r][c] == 0) continue;
+                    int cx = xOffset + c * CELL_SIZE;
+                    int cy = yOffset + r * CELL_SIZE;
+                    // Highlight hint move
+                    if (hintMove != null && hintMove.x == r && hintMove.y == c) {
+                        g.setColor(Color.YELLOW);
+                        g.fillRect(cx, cy, CELL_SIZE, CELL_SIZE);
+                    }
+                    g.setColor(isLegalMove(r, c) ? BOARD_COLOR : DISABLED_COLOR);
+                    g.fillRect(cx, cy, CELL_SIZE, CELL_SIZE);
+                    g.setColor(Color.BLACK);
+                    g.drawRect(cx, cy, CELL_SIZE, CELL_SIZE);
+                    if (state[r][c] != null) {
+                        g.setColor("black".equals(state[r][c]) ? BLACK : WHITE);
+                        g.fillOval(cx + 7, cy + 7, CELL_SIZE - 14, CELL_SIZE - 14);
+                        g.setColor("black".equals(state[r][c]) ? Color.WHITE : Color.BLACK);
+                        List<Point> group = getGroup(r, c, state[r][c], new HashSet<>());
+                        String num = String.valueOf(group.size());
+                        FontMetrics fm = g.getFontMetrics();
+                        int tx = cx + CELL_SIZE / 2 - fm.stringWidth(num) / 2;
+                        int ty = cy + CELL_SIZE / 2 + fm.getAscent() / 2 - 4;
+                        g.drawString(num, tx, ty);
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Game Logic ---
+
+    private List<Point> getNeighbors(int r, int c) {
+        int[][] dirs = {{0,-1},{0,1},{-1,0},{1,0},{-1,-1},{1,1}};
+        List<Point> neighbors = new ArrayList<>();
+        for (int[] d : dirs) {
+            int nr = r + d[0], nc = c + d[1];
+            if (nr >= 0 && nr < LAYOUT.length && nc >= 0 && nc < LAYOUT[nr].length && LAYOUT[nr][nc] == 1) {
+                neighbors.add(new Point(nr, nc));
+            }
+        }
+        return neighbors;
+    }
+
+    private List<Point> getGroup(int r, int c, String color, Set<String> visited) {
+        String key = r + "," + c;
+        if (visited.contains(key)) return Collections.emptyList();
+        if (!color.equals(state[r][c])) return Collections.emptyList();
+        visited.add(key);
+        List<Point> group = new ArrayList<>();
+        group.add(new Point(r, c));
+        for (Point n : getNeighbors(r, c)) {
+            if (color.equals(state[n.x][n.y])) {
+                group.addAll(getGroup(n.x, n.y, color, visited));
+            }
+        }
+        return group;
+    }
+
+    private void removeSmallerStones(String enemyColor, int threshold) {
+        for (int r = 0; r < state.length; r++) {
+            for (int c = 0; c < state[r].length; c++) {
+                if (!enemyColor.equals(state[r][c])) continue;
+                List<Point> group = getGroup(r, c, enemyColor, new HashSet<>());
+                if (group.size() < threshold) {
+                    for (Point p : group) {
+                        state[p.x][p.y] = null;
+                    }
+                }
+            }
+        }
+    }
+
+    private int simulateGroupSize(int r, int c, String color) {
+        if (state[r][c] != null) return 0;
+        state[r][c] = color;
+        int size = getGroup(r, c, color, new HashSet<>()).size();
+        state[r][c] = null;
+        return size;
+    }
+
+    private int calculateMinGroupSize(String color) {
+        int minSize = Integer.MAX_VALUE;
+        boolean foundAny = false;
+        for (int r = 0; r < state.length; r++) {
+            for (int c = 0; c < state[r].length; c++) {
+                if (LAYOUT[r][c] == 0 || state[r][c] != null) continue;
+                int size = simulateGroupSize(r, c, color);
+                if (size > 0 && size < minSize) minSize = size;
+                foundAny = true;
+            }
+        }
+        if (!foundAny || minSize == Integer.MAX_VALUE) return 0;
+        return minSize;
+    }
+
+    private boolean isLegalMove(int r, int c) {
+        if (gameOver || LAYOUT[r][c] == 0 || state[r][c] != null) return false;
+        int minGroupSize = calculateMinGroupSize(currentPlayer);
+        int possibleSize = simulateGroupSize(r, c, currentPlayer);
+        return possibleSize == minGroupSize && minGroupSize > 0;
+    }
+
+    private boolean hasLegalMoves(String color) {
+        return calculateMinGroupSize(color) > 0;
+    }
+
+    private void toggleBotColor() {
+        botColor = botColor.equals("white") ? "black" : "white";
+        botColorBtn.setText("Bot: " + capitalize(botColor));
+        maybeTriggerBot();
+    }
+
+    private void showHint() {
+        memo.clear();
+        hintMove = getBestMove(currentPlayer);
+        boardPanel.repaint();
+        if (hintMove != null) {
+            infoLabel.setText("Recommended: (" + hintMove.x + ", " + hintMove.y + ")");
+        } else {
+            infoLabel.setText("No legal moves");
+        }
+    }
+
+    private void clearHint() {
+        hintMove = null;
+        updateInfo();
+    }
+
+    private void maybeTriggerBot() {
+        if (!gameOver && botColor.equals(currentPlayer)) {
+            botTimer.setRepeats(false);
+            botTimer.restart();
+        }
+    }
+
+    private int evaluateBoard(String player) {
+        int blackCount = 0, whiteCount = 0;
+        for (int r = 0; r < state.length; r++) {
+            for (int c = 0; c < state[r].length; c++) {
+                if ("black".equals(state[r][c])) blackCount++;
+                if ("white".equals(state[r][c])) whiteCount++;
+            }
+        }
+        if (!hasLegalMoves("black") && !hasLegalMoves("white")) {
+            if (blackCount > whiteCount) return player.equals("black") ? WIN_SCORE : LOSE_SCORE;
+            if (whiteCount > blackCount) return player.equals("white") ? WIN_SCORE : LOSE_SCORE;
+            return DRAW_SCORE;
+        }
+        // Heuristic: difference in stone count
+        return (player.equals("white") ? (whiteCount - blackCount) : (blackCount - whiteCount));
+    }
+
+    private String boardHash(String player) {
+        StringBuilder sb = new StringBuilder();
+        for (int r = 0; r < state.length; r++) {
+            for (int c = 0; c < state[r].length; c++) {
+                sb.append(state[r][c] == null ? "_" : state[r][c].charAt(0));
+            }
+        }
+        sb.append(player.charAt(0));
+        return sb.toString();
+    }
+
+    private int minimax(int depth, int alpha, int beta, boolean maximizingPlayer, String player) {
+        String hash = boardHash(player) + depth + maximizingPlayer;
+        if (memo.containsKey(hash)) return memo.get(hash);
+        if (depth == 0 || !hasLegalMoves(player)) {
+            int eval = evaluateBoard(player);
+            memo.put(hash, eval);
+            return eval;
+        }
+        List<Point> moves = getAllLegalMoves(player);
+        if (moves.isEmpty()) {
+            int eval = evaluateBoard(player);
+            memo.put(hash, eval);
+            return eval;
+        }
+        int bestEval = maximizingPlayer ? Integer.MIN_VALUE : Integer.MAX_VALUE;
+        for (Point move : moves) {
+            // Save state
+            String prev = state[move.x][move.y];
+            String[][] backup = new String[state.length][];
+            for (int r = 0; r < state.length; r++) backup[r] = Arrays.copyOf(state[r], state[r].length);
+            state[move.x][move.y] = player;
+            removeSmallerStones(player, getGroup(move.x, move.y, player, new HashSet<>()).size());
+            String nextPlayer = player.equals("black") ? "white" : "black";
+            int eval = minimax(depth - 1, alpha, beta, !maximizingPlayer, nextPlayer);
+            // Restore state
+            for (int r = 0; r < state.length; r++) state[r] = Arrays.copyOf(backup[r], backup[r].length);
+            if (maximizingPlayer) {
+                bestEval = Math.max(bestEval, eval);
+                alpha = Math.max(alpha, eval);
+                if (beta <= alpha) break;
+            } else {
+                bestEval = Math.min(bestEval, eval);
+                beta = Math.min(beta, eval);
+                if (beta <= alpha) break;
+            }
+        }
+        memo.put(hash, bestEval);
+        return bestEval;
+    }
+
+    private void computeTablebase() {
+        tablebase.clear();
+        String[][] initial = new String[LAYOUT.length][];
+        for (int r = 0; r < LAYOUT.length; r++) initial[r] = new String[LAYOUT[r].length];
+        computeTablebaseRecursive(initial, "black");
+        computeTablebaseRecursive(initial, "white");
+        tablebaseReady = true;
+    }
+
+    private int computeTablebaseRecursive(String[][] board, String player) {
+        String hash = boardHash(board, player);
+        if (tablebase.containsKey(hash)) return tablebase.get(hash).score;
+        int blackCount = 0, whiteCount = 0;
+        for (int r = 0; r < board.length; r++) {
+            for (int c = 0; c < board[r].length; c++) {
+                if ("black".equals(board[r][c])) blackCount++;
+                if ("white".equals(board[r][c])) whiteCount++;
+            }
+        }
+        if (!hasLegalMoves(board, "black") && !hasLegalMoves(board, "white")) {
+            int score;
+            if (blackCount > whiteCount) score = player.equals("black") ? WIN_SCORE : LOSE_SCORE;
+            else if (whiteCount > blackCount) score = player.equals("white") ? WIN_SCORE : LOSE_SCORE;
+            else score = DRAW_SCORE;
+            tablebase.put(hash, new TablebaseEntry(score, null));
+            return score;
+        }
+        List<Point> moves = getAllLegalMoves(board, player);
+        if (moves.isEmpty()) {
+            int score = (player.equals("white") ? (whiteCount - blackCount) : (blackCount - whiteCount));
+            tablebase.put(hash, new TablebaseEntry(score, null));
+            return score;
+        }
+        int bestEval = player.equals("white") ? Integer.MIN_VALUE : Integer.MAX_VALUE;
+        Point bestMove = null;
+        for (Point move : moves) {
+            String[][] backup = new String[board.length][];
+            for (int r = 0; r < board.length; r++) backup[r] = Arrays.copyOf(board[r], board[r].length);
+            board[move.x][move.y] = player;
+            removeSmallerStones(board, player, getGroup(board, move.x, move.y, player, new HashSet<>()).size());
+            String nextPlayer = player.equals("black") ? "white" : "black";
+            int eval = computeTablebaseRecursive(board, nextPlayer);
+            for (int r = 0; r < board.length; r++) board[r] = Arrays.copyOf(backup[r], backup[r].length);
+            if ((player.equals("white") && eval > bestEval) || (player.equals("black") && eval < bestEval) || bestMove == null) {
+                bestEval = eval;
+                bestMove = move;
+            }
+        }
+        tablebase.put(hash, new TablebaseEntry(bestEval, bestMove));
+        return bestEval;
+    }
+
+    private String boardHash(String[][] board, String player) {
+        StringBuilder sb = new StringBuilder();
+        for (int r = 0; r < board.length; r++) {
+            for (int c = 0; c < board[r].length; c++) {
+                sb.append(board[r][c] == null ? "_" : board[r][c].charAt(0));
+            }
+        }
+        sb.append(player.charAt(0));
+        return sb.toString();
+    }
+
+    private List<Point> getAllLegalMoves(String[][] board, String color) {
+        List<Point> moves = new ArrayList<>();
+        for (int r = 0; r < board.length; r++) {
+            for (int c = 0; c < board[r].length; c++) {
+                if (isLegalMoveFor(board, r, c, color)) {
+                    moves.add(new Point(r, c));
+                }
+            }
+        }
+        return moves;
+    }
+
+    private boolean isLegalMoveFor(String[][] board, int r, int c, String color) {
+        if (LAYOUT[r][c] == 0 || board[r][c] != null) return false;
+        int minGroupSize = calculateMinGroupSize(board, color);
+        int possibleSize = simulateGroupSize(board, r, c, color);
+        return possibleSize == minGroupSize && minGroupSize > 0;
+    }
+
+    private boolean hasLegalMoves(String[][] board, String color) {
+        return calculateMinGroupSize(board, color) > 0;
+    }
+
+    private int simulateGroupSize(String[][] board, int r, int c, String color) {
+        if (board[r][c] != null) return 0;
+        board[r][c] = color;
+        int size = getGroup(board, r, c, color, new HashSet<>()).size();
+        board[r][c] = null;
+        return size;
+    }
+
+    private int calculateMinGroupSize(String[][] board, String color) {
+        int minSize = Integer.MAX_VALUE;
+        boolean foundAny = false;
+        for (int r = 0; r < board.length; r++) {
+            for (int c = 0; c < board[r].length; c++) {
+                if (LAYOUT[r][c] == 0 || board[r][c] != null) continue;
+                int size = simulateGroupSize(board, r, c, color);
+                if (size > 0 && size < minSize) minSize = size;
+                foundAny = true;
+            }
+        }
+        if (!foundAny || minSize == Integer.MAX_VALUE) return 0;
+        return minSize;
+    }
+
+    private List<Point> getGroup(String[][] board, int r, int c, String color, Set<String> visited) {
+        String key = r + "," + c;
+        if (visited.contains(key)) return Collections.emptyList();
+        if (!color.equals(board[r][c])) return Collections.emptyList();
+        visited.add(key);
+        List<Point> group = new ArrayList<>();
+        group.add(new Point(r, c));
+        for (Point n : getNeighbors(r, c)) {
+            if (color.equals(board[n.x][n.y])) {
+                group.addAll(getGroup(board, n.x, n.y, color, visited));
+            }
+        }
+        return group;
+    }
+
+    private void removeSmallerStones(String[][] board, String enemyColor, int threshold) {
+        for (int r = 0; r < board.length; r++) {
+            for (int c = 0; c < board[r].length; c++) {
+                if (!enemyColor.equals(board[r][c])) continue;
+                List<Point> group = getGroup(board, r, c, enemyColor, new HashSet<>());
+                if (group.size() < threshold) {
+                    for (Point p : group) {
+                        board[p.x][p.y] = null;
+                    }
+                }
+            }
+        }
+    }
+
+    // Use tablebase for bot and hint
+    private Point getBestMove(String player) {
+        String hash = boardHash(state, player);
+        TablebaseEntry entry = tablebase.get(hash);
+        if (entry != null) return entry.bestMove;
+        return null;
+    }
+
+    @Override
+    protected void finalize() throws Throwable {
+        super.finalize();
+        botTimer.stop();
+    }
+
+    @Override
+    public void dispose() {
+        botTimer.stop();
+        super.dispose();
+    }
+
+    // Update botMove to use getBestMove
+    private void botMove() {
+        if (gameOver || !botColor.equals(currentPlayer)) return;
+        memo.clear();
+        List<Point> legalMoves = getAllLegalMoves(botColor);
+        if (legalMoves.isEmpty()) {
+            endGame();
+            return;
+        }
+        Point move = getBestMove(botColor);
+        if (move == null) move = legalMoves.get(random.nextInt(legalMoves.size()));
+        pushHistory();
+        state[move.x][move.y] = botColor;
+        removeSmallerStones(botColor, getGroup(move.x, move.y, botColor, new HashSet<>()).size());
+        currentPlayer = botColor.equals("black") ? "white" : "black";
+        clearHint();
+        updateInfo();
+        if (!hasLegalMoves(currentPlayer)) {
+            endGame();
+        }
+        boardPanel.repaint();
+        maybeTriggerBot(); // In case bot plays both sides
+    }
+
+    public static void main(String[] args) {
+        SwingUtilities.invokeLater(ErgeltBoardGame::new);
+    }
+}
